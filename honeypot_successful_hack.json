@@ -1,0 +1,1 @@
+{"host":"honeypot-fra-1","@version":"1","message":"Sep 19 02:14:51 honeypot-fra-1 sshd[31513]: Accepted password for debian from 103.241.181.174 port 32856 ssh2","@timestamp":"2022-09-19T02:14:51.011Z","path":"/var/log/auth.log"}
