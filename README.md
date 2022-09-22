@@ -5,6 +5,10 @@ If you missed the meetup, here's the recorded link:
 
 https://www.youtube.com/watch?v=s80sz3NWwHo
 
+Installing CSP-CE/Community edition for Docker:
+
+https://docs.cloudera.com/csp-ce/latest/installation/topics/csp-ce-installing-ce.html
+
 # Sample streams data
 
 - honeypot_login_attempts.json contains raw SSH connection attempts
