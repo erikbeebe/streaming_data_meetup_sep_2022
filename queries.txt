@@ -1,0 +1,159 @@
+// Simple select * to ensure source works
+SELECT *
+FROM honeypot_logs
+
+
+// Input transformation to extract timestamps and convert to epoch time
+var payload = JSON.parse(record.value);
+var output = payload;
+output['data_timestamp'] = Date.parse(payload['@timestamp']);
+delete output['@timestamp'];
+delete output['@value'];
+JSON.stringify(output);
+
+// Add this to the schema to support new extracted timestamp,
+// and then configure the timestamp under the Event Time tab
+    {
+      "name": "data_timestamp",
+      "type": "long"
+    }
+
+
+// Query with regular expression extraction
+SELECT
+  REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 1) AS username,
+  REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 2) AS source_ip,
+  eventTimestamp
+from honeypot_logs
+where REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 1) IS NOT NULL
+
+// Common table expression option for preparsing
+// With a Kafka timestamp
+WITH parsed_honeypots AS (
+SELECT
+  REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 1) AS username,
+  REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 2) AS source_ip,
+  eventTimestamp
+from honeypot_logs
+where message like '%Invalid user%'
+)
+SELECT *
+FROM parsed_honeypots
+
+
+// CTE with TUMBLE window
+WITH parsed_honeypots AS (
+SELECT
+  REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 1) AS username,
+  REGEXP_EXTRACT(message, '^.*Invalid user (.*) from (.*) port.*$', 2) AS source_ip,
+  eventTimestamp
+from honeypot_logs
+where message like '%Invalid user%'
+)
+select username, source_ip,
+  count(*) as seen_count,
+  TUMBLE_END(eventTimestamp, INTERVAL '1' HOUR) as window_end
+from parsed_honeypots
+group by
+  TUMBLE(eventTimestamp, INTERVAL '1' HOUR),
+  username, source_ip
+having count(*) > 5
+
+// Improve pattern match to include accepted logins as well
+WITH parsed_honeypots AS (
+  SELECT
+  CASE REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 1)
+    WHEN 'Accepted password for' THEN TRUE
+    WHEN 'Invalid user' THEN FALSE
+  END as valid_login,
+    REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 2) AS username,
+    REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 3) AS source_ip,
+  eventTimestamp
+  from honeypot_logs
+  where (message like '%Accepted password for%'
+   OR message like '%Invalid user%')
+)
+SELECT *
+FROM parsed_honeypots
+
+
+// Simple MATCH_RECOGNIZE query to look for failed login -> successful login pattern
+WITH parsed_honeypots AS (
+  SELECT
+  CASE REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 1)
+    WHEN 'Accepted password for' THEN TRUE
+    WHEN 'Invalid user' THEN FALSE
+  END as login_successful,
+    REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 2) AS username,
+    REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 3) AS source_ip,
+    eventTimestamp
+  FROM honeypot_logs_kafka_timestamps
+  WHERE (message like '%Accepted password for%'
+    OR message like '%Invalid user%')
+  )
+  SELECT MR.hacked_username, MR.hacked_from_source_ip,
+    MR.hacked_timestamp
+  FROM parsed_honeypots
+  MATCH_RECOGNIZE(
+    PARTITION BY source_ip
+    ORDER BY eventTimestamp
+    MEASURES
+      B.username AS hacked_username,
+      B.eventTimestamp as hacked_timestamp,
+      A.source_ip AS hacked_from_source_ip
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A{3} B)
+    WITHIN INTERVAL '1' DAY
+    DEFINE
+      A AS A.login_successful IS false,
+      B AS B.login_successful IS true) AS MR
+
+
+// Enrich MATCH_RECOGNIZE matches with external ip2location table
+// Note: requires you to add IP2DEC UDF, included below
+WITH hacked_accounts AS (
+  WITH parsed_honeypots AS (
+    SELECT
+    CASE REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 1)
+      WHEN 'Accepted password for' THEN TRUE
+      WHEN 'Invalid user' THEN FALSE
+    END as login_successful,
+      REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 2) AS username,
+      REGEXP_EXTRACT(message, '^.*(Accepted password for|Invalid user) (.*) from (.*) port.*$', 3) AS source_ip,
+    eventTimestamp
+    from honeypot_logs_kafka_timestamps
+    where (message like '%Accepted password for%'
+    OR message like '%Invalid user%')
+  )
+  SELECT MR.hacked_username, MR.hacked_from_source_ip,
+    MR.hacked_timestamp
+  FROM parsed_honeypots
+  MATCH_RECOGNIZE(
+    PARTITION BY source_ip
+    ORDER BY eventTimestamp
+    MEASURES
+        B.username AS hacked_username,
+        B.eventTimestamp as hacked_timestamp,
+        A.source_ip AS hacked_from_source_ip
+    ONE ROW PER MATCH
+    AFTER MATCH SKIP PAST LAST ROW
+    PATTERN (A{3} B)
+    WITHIN INTERVAL '1' DAY
+    DEFINE
+      A AS A.login_successful IS false,
+      B AS B.login_successful IS true) AS MR
+)
+SELECT h.*, ip2.*
+FROM hacked_accounts h,
+ ip2location ip2
+WHERE ip2.ip_from <= IP2DEC(h.hacked_from_source_ip)
+  AND ip2.ip_to >= IP2DEC(h.hacked_from_source_ip)
+
+
+// IP2DEC UDF
+// Configure input type -> STRING, output type -> BIGINT
+function ip2int(ip) {
+    return ip.split('.').reduce(function(ipInt, octet) { return (ipInt<<8) + parseInt(octet, 10)}, 0) >>> 0;
+}
+ip2int($p0);  // this line must exist
